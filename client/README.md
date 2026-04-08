@@ -120,29 +120,7 @@ src/
 
 ---
 
-## 📬 Postman Testing
 
-Two files are included:
-
-1. **`PayTrack_API.postman_collection.json`** — Full collection (8 folders, 40+ requests)
-2. **`PayTrack_Local.postman_environment.json`** — Local environment variables
-
-### Import Steps
-
-1. Open Postman → **Import** → drag both JSON files
-2. Select **PayTrack - Local** environment
-3. Run **Register** or **Login** → `accessToken` auto-saves
-4. All subsequent requests use `Bearer {{accessToken}}` automatically
-
-### Test Scripts
-
-- **Register/Login** → auto-sets `accessToken` + `userId`
-- **List Expenses** → auto-sets `expenseId` + `memberId`
-- **Create Group** → auto-sets `groupId`
-- **List Notifications** → auto-sets `notificationId`
-- All folders have `pm.test()` assertions for status codes & response shape
-
----
 
 ## 🏗️ Tech Stack
 
