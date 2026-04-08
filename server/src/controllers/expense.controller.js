@@ -13,9 +13,9 @@ const logger = require('../config/logger');
 const EXPENSES_PER_PAGE = 15;
 
 const cacheKeys = {
-  expenses: (userId, query) => `expenses:${userId}:${JSON.stringify(query)}`,
-  balance: (userId) => `balance:${userId}`,
-  monthlyTotal: (userId, y, m) => `monthly:${userId}:${y}:${m}`,
+  expenses:     (userId, query) => `expenses:${userId}:${JSON.stringify(query)}`,
+  balance:      (userId)        => `balance:${userId}`,
+  monthlyTotal: (userId, y, m)  => `monthly:${userId}:${y}:${m}`,
 };
 
 async function invalidateUserCaches(userId) {
@@ -28,35 +28,48 @@ async function invalidateUserCaches(userId) {
 }
 
 // ─── List expenses ────────────────────────────────────────────────────────────
-// Returns expenses where the user is OWNER *or* a MEMBER (so targets see group expenses)
 exports.listExpenses = catchAsync(async (req, res) => {
   const userId = req.user.id;
-  const { month, year, type, category, page = 1, limit = EXPENSES_PER_PAGE, search } = req.query;
+  const {
+    month, year, type, category,
+    page  = 1,
+    limit = EXPENSES_PER_PAGE,
+    search,
+    // New: ISO date strings for an explicit date range
+    startDate,
+    endDate,
+  } = req.query;
 
   const userObjectId = new mongoose.Types.ObjectId(userId);
 
-  // Base filter: user is owner OR is a member of the expense
   const ownerOrMember = {
     isDeleted: false,
     $or: [
-      { ownerId: userObjectId },
+      { ownerId:          userObjectId },
       { 'members.userId': userObjectId },
     ],
   };
 
-  if (month && year) {
+  // ── Date filter — range takes priority over month+year ──────────────────
+  if (startDate && endDate) {
+    ownerOrMember.expenseDate = {
+      $gte: new Date(startDate),
+      $lte: new Date(new Date(endDate).setHours(23, 59, 59, 999)),
+    };
+  } else if (month && year) {
     ownerOrMember.expenseDate = {
       $gte: new Date(year, month - 1, 1),
       $lte: new Date(year, month, 0, 23, 59, 59),
     };
   }
+
   if (type && ['individual', 'equal_group', 'custom_group'].includes(type)) {
     ownerOrMember.type = type;
   }
   if (category) ownerOrMember.category = category;
-  if (search) ownerOrMember.description = { $regex: search, $options: 'i' };
+  if (search)   ownerOrMember.description = { $regex: search, $options: 'i' };
 
-  const skip = (parseInt(page) - 1) * parseInt(limit);
+  const skip     = (parseInt(page) - 1) * parseInt(limit);
   const cacheKey = cacheKeys.expenses(userId, { ownerOrMember, skip, limit });
 
   const result = await cacheOrFetch(cacheKey, async () => {
@@ -75,9 +88,9 @@ exports.listExpenses = catchAsync(async (req, res) => {
       expenses,
       pagination: {
         total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        hasMore: skip + expenses.length < total,
+        page:       parseInt(page),
+        limit:      parseInt(limit),
+        hasMore:    skip + expenses.length < total,
         totalPages: Math.ceil(total / parseInt(limit)),
       },
     };
@@ -96,7 +109,10 @@ exports.createExpense = catchAsync(async (req, res) => {
 
   let processedMembers = [];
   if (members && members.length > 0 && type !== 'individual') {
-    const memberIds = members.map(m => m.userId).filter(Boolean);
+    // Exclude the owner themselves from the member list
+    const memberIds = members
+      .map(m => m.userId)
+      .filter(id => id && id.toString() !== userId.toString());
 
     const connectionChecks = await Promise.all(
       memberIds.map(id => Connection.areConnected(userId, id))
@@ -111,22 +127,23 @@ exports.createExpense = catchAsync(async (req, res) => {
       .lean();
     const memberMap = Object.fromEntries(memberUsers.map(u => [u._id.toString(), u]));
 
-    processedMembers = members.map(m => {
-      const user = memberMap[m.userId];
-      let memberAmount = parseFloat(m.amount) || 0;
+    processedMembers = memberIds.map(mid => {
+      const m    = members.find(x => x.userId === mid || x.userId?.toString() === mid);
+      const user = memberMap[mid];
+      let memberAmount = parseFloat(m?.amount) || 0;
       if (type === 'equal_group') {
-        memberAmount = parseFloat((amount / (members.length + 1)).toFixed(2));
+        memberAmount = parseFloat((amount / (memberIds.length + 1)).toFixed(2));
       }
       return {
-        userId: m.userId,
-        username: user?.username,
+        userId:      mid,
+        username:    user?.username,
         displayName: user?.displayName || user?.username,
-        avatar: user?.avatar,
+        avatar:      user?.avatar,
         avatarColor: user?.avatarColor,
-        amount: memberAmount,
-        status: 'added',
-        splitType: type === 'equal_group' ? 'equal' : 'custom',
-        splitValue: m.splitValue,
+        amount:      memberAmount,
+        status:      'added',
+        splitType:   type === 'equal_group' ? 'equal' : 'custom',
+        splitValue:  m?.splitValue,
       };
     });
   }
@@ -143,61 +160,51 @@ exports.createExpense = catchAsync(async (req, res) => {
   }
 
   const expense = await Expense.create({
-    ownerId: userId,
-    type,
-    description,
-    amount: parseFloat(amount),
-    currency: currency || 'USD',
-    category: category || 'other',
+    ownerId: userId, type, description,
+    amount:          parseFloat(amount),
+    currency:        currency || 'USD',
+    category:        category || 'other',
     customCategory,
-    expenseDate: expenseDate ? new Date(expenseDate) : new Date(),
-    groupId: groupId || null,
-    members: processedMembers,
-    totalAmount: parseFloat(amount),
+    expenseDate:     expenseDate ? new Date(expenseDate) : new Date(),
+    groupId:         groupId || null,
+    members:         processedMembers,
+    totalAmount:     parseFloat(amount),
     recoveredAmount: 0,
-    notes,
-    localId,
+    notes, localId,
     syncedAt: new Date(),
   });
 
-  // Notify all members that they've been added to an expense
   if (processedMembers.length > 0) {
     const owner = await User.findById(userId).select('username displayName').lean();
     await Promise.allSettled(
       processedMembers.map(m =>
         createNotification({
           recipientId: m.userId,
-          senderId: userId,
-          type: 'expense_added',
-          title: 'Added to Expense',
-          body: `${owner?.displayName || owner?.username} added you to "${description}" (${currency || 'USD'} ${amount})`,
-          data: { expenseId: expense._id },
+          senderId:    userId,
+          type:        'expense_added',
+          title:       'Added to Expense',
+          body:        `${owner?.displayName || owner?.username} added you to "${description}" (${currency || 'USD'} ${amount})`,
+          data:        { expenseId: expense._id },
         })
       )
     );
   }
 
-  // Invalidate caches for owner and all members
   const allUserIds = [userId, ...processedMembers.map(m => m.userId.toString())];
   await Promise.allSettled(allUserIds.map(id => invalidateUserCaches(id)));
-
   logger.info(`Expense created: ${expense._id} by user ${userId}`);
 
   const populated = await Expense.findById(expense._id)
     .populate('members.userId', 'username displayName avatar avatarColor')
     .populate('groupId', 'name avatarColor');
 
-  res.status(201).json({
-    success: true,
-    message: 'Expense created successfully',
-    data: { expense: populated },
-  });
+  res.status(201).json({ success: true, message: 'Expense created successfully', data: { expense: populated } });
 });
 
 // ─── Update expense ───────────────────────────────────────────────────────────
 exports.updateExpense = catchAsync(async (req, res) => {
   const { id } = req.params;
-  const userId = req.user.id;
+  const userId  = req.user.id;
 
   const expense = await Expense.findOne({ _id: id, ownerId: userId, isDeleted: false });
   if (!expense) throw new AppError('Expense not found or you are not the owner', 404);
@@ -223,7 +230,7 @@ exports.updateExpense = catchAsync(async (req, res) => {
 // ─── Delete expense ───────────────────────────────────────────────────────────
 exports.deleteExpense = catchAsync(async (req, res) => {
   const { id } = req.params;
-  const userId = req.user.id;
+  const userId  = req.user.id;
 
   const expense = await Expense.findOneAndUpdate(
     { _id: id, ownerId: userId, isDeleted: false },
@@ -241,7 +248,7 @@ exports.deleteExpense = catchAsync(async (req, res) => {
 // ─── Notify members ───────────────────────────────────────────────────────────
 exports.notifyMembers = catchAsync(async (req, res) => {
   const { id } = req.params;
-  const userId = req.user.id;
+  const userId  = req.user.id;
 
   const expense = await Expense.findOne({ _id: id, ownerId: userId, isDeleted: false })
     .populate('members.userId', 'username displayName pushSubscriptions');
@@ -259,8 +266,8 @@ exports.notifyMembers = catchAsync(async (req, res) => {
     const obj = m.toObject ? m.toObject() : { ...m };
     return {
       ...obj,
-      status: obj.status === 'added' ? 'notified' : obj.status,
-      notifiedAt: obj.status === 'added' ? new Date() : obj.notifiedAt,
+      status:      obj.status === 'added' ? 'notified' : obj.status,
+      notifiedAt:  obj.status === 'added' ? new Date() : obj.notifiedAt,
     };
   });
 
@@ -271,50 +278,39 @@ exports.notifyMembers = catchAsync(async (req, res) => {
 });
 
 // ─── Mark member as paid ──────────────────────────────────────────────────────
-// Either the owner can mark any member paid, OR the member can mark themselves paid
 exports.markMemberPaid = catchAsync(async (req, res) => {
   const { id, memberId } = req.params;
-  const userId = req.user.id;
+  const userId            = req.user.id;
 
   const expense = await Expense.findOne({ _id: id, isDeleted: false });
   if (!expense) throw new AppError('Expense not found', 404);
 
   const isOwner = expense.ownerId.toString() === userId;
-  const member = expense.members.id(memberId);
+  const member  = expense.members.id(memberId);
   if (!member) throw new AppError('Member not found in expense', 404);
 
-  // Only owner OR the member themselves can mark paid
   const isSelf = member.userId.toString() === userId;
-  if (!isOwner && !isSelf) {
-    throw new AppError('Only the expense owner or the member themselves can mark as paid', 403);
-  }
-
+  if (!isOwner && !isSelf) throw new AppError('Only the expense owner or the member themselves can mark as paid', 403);
   if (member.status === 'paid') throw new AppError('Member already marked as paid', 400);
 
   const wasAmount = member.amount;
-  member.status = 'paid';
-  member.paidAt = new Date();
+  member.status   = 'paid';
+  member.paidAt   = new Date();
   expense.recoveredAmount = Math.min(expense.totalAmount, expense.recoveredAmount + wasAmount);
 
   await expense.save();
 
-  // Notify the expense owner if the member marked themselves paid
   if (isSelf && !isOwner) {
     await createNotification({
-      recipientId: expense.ownerId,
-      senderId: userId,
-      type: 'payment_received',
-      title: 'Payment Received',
-      body: `${req.user.displayName || req.user.username || 'A member'} marked their payment of ${expense.currency} ${wasAmount} for "${expense.description}" as paid.`,
+      recipientId: expense.ownerId, senderId: userId,
+      type: 'payment_received', title: 'Payment Received',
+      body: `${req.user.displayName || req.user.username} marked ${expense.currency} ${wasAmount} for "${expense.description}" as paid.`,
       data: { expenseId: expense._id },
     });
   } else if (isOwner && !isSelf) {
-    // Notify the member their payment was confirmed by owner
     await createNotification({
-      recipientId: member.userId,
-      senderId: userId,
-      type: 'payment_received',
-      title: 'Payment Confirmed',
+      recipientId: member.userId, senderId: userId,
+      type: 'payment_received', title: 'Payment Confirmed',
       body: `Your payment of ${expense.currency} ${wasAmount} for "${expense.description}" has been confirmed.`,
       data: { expenseId: expense._id },
     });
@@ -331,27 +327,27 @@ exports.markMemberPaid = catchAsync(async (req, res) => {
 
 // ─── Balance summary ──────────────────────────────────────────────────────────
 exports.getBalanceSummary = catchAsync(async (req, res) => {
-  const userId = req.user.id;
+  const userId   = req.user.id;
   const cacheKey = cacheKeys.balance(userId);
-  const summary = await cacheOrFetch(cacheKey, () => Expense.getBalanceSummary(userId), 120);
+  const summary  = await cacheOrFetch(cacheKey, () => Expense.getBalanceSummary(userId), 120);
   res.status(200).json({ success: true, data: summary });
 });
 
 // ─── Monthly total ────────────────────────────────────────────────────────────
 exports.getMonthlyTotal = catchAsync(async (req, res) => {
-  const userId = req.user.id;
+  const userId   = req.user.id;
   const { year, month } = req.query;
-  const y = parseInt(year) || new Date().getFullYear();
-  const m = parseInt(month) || new Date().getMonth() + 1;
+  const y        = parseInt(year)  || new Date().getFullYear();
+  const m        = parseInt(month) || new Date().getMonth() + 1;
   const cacheKey = cacheKeys.monthlyTotal(userId, y, m);
-  const total = await cacheOrFetch(cacheKey, () => Expense.getMonthlyTotal(userId, y, m), 120);
+  const total    = await cacheOrFetch(cacheKey, () => Expense.getMonthlyTotal(userId, y, m), 120);
   res.status(200).json({ success: true, data: total });
 });
 
 // ─── Change expense type ──────────────────────────────────────────────────────
 exports.changeType = catchAsync(async (req, res) => {
   const { id } = req.params;
-  const userId = req.user.id;
+  const userId  = req.user.id;
 
   const expense = await Expense.findOne({ _id: id, ownerId: userId, isDeleted: false });
   if (!expense) throw new AppError('Expense not found', 404);
@@ -360,7 +356,7 @@ exports.changeType = catchAsync(async (req, res) => {
   expense.type = typeOrder[(typeOrder.indexOf(expense.type) + 1) % typeOrder.length];
 
   if (expense.type === 'individual') {
-    expense.members = [];
+    expense.members         = [];
     expense.recoveredAmount = 0;
   }
 

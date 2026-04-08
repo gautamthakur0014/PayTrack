@@ -3,13 +3,21 @@
 const Notification = require('../models/Notification.model');
 const User = require('../models/User.model');
 const { sendPushNotification } = require('../config/webpush');
-const { getClient } = require('../config/redis');
 const logger = require('../config/logger');
 
 /**
- * Create a notification record and optionally send push notification.
+ * Create a DB notification record AND immediately fire push notifications.
+ *
+ * Previous bug: push was only enqueued to Redis and the queue was never
+ * drained, so push notifications were silently dropped.
+ *
+ * Fix: after saving the Notification document we call sendDirectPush()
+ * right away (fire-and-forget). Redis queue is kept as an optional
+ * secondary delivery channel if it is available, but we no longer
+ * depend on it for delivery.
  */
 async function createNotification({ recipientId, senderId, type, title, body, data = {} }) {
+  // 1. Persist to DB
   const notification = await Notification.create({
     recipientId,
     senderId,
@@ -19,27 +27,33 @@ async function createNotification({ recipientId, senderId, type, title, body, da
     data,
   });
 
-  // Enqueue push notification
+  // 2. Fire push immediately — do not await so the caller is not blocked
+  sendDirectPush(recipientId, { title, body, data: { ...data, url: '/notifications' } })
+    .catch(err => logger.warn('[Push] Direct push error:', err.message));
+
+  // 3. Also try to enqueue to Redis as a secondary delivery (optional)
   try {
+    const { getClient } = require('../config/redis');
     const redis = getClient();
-    await redis.rpush('push:queue', JSON.stringify({
-      recipientId: recipientId.toString(),
-      notificationId: notification._id.toString(),
-      title,
-      body,
-      data,
-    }));
-  } catch (err) {
-    logger.warn('Failed to enqueue push notification:', err.message);
-    // Non-fatal — send directly
-    await sendDirectPush(recipientId, { title, body, data });
+    if (redis) {
+      await redis.rpush('push:queue', JSON.stringify({
+        recipientId: recipientId.toString(),
+        notificationId: notification._id.toString(),
+        title,
+        body,
+        data,
+      }));
+    }
+  } catch {
+    // Redis unavailable — push already sent directly above, so this is fine
   }
 
   return notification;
 }
 
 /**
- * Send push notification directly to all subscriptions of a user.
+ * Send a web push notification to every active subscription of a user.
+ * Automatically removes expired subscriptions from the user document.
  */
 async function sendDirectPush(userId, payload) {
   try {
@@ -50,38 +64,47 @@ async function sendDirectPush(userId, payload) {
       user.pushSubscriptions.map(sub => sendPushNotification(sub, payload))
     );
 
-    // Remove expired subscriptions
-    const expiredIndexes = results
-      .map((r, i) => (r.status === 'fulfilled' && r.value?.expired ? i : -1))
-      .filter(i => i !== -1);
+    // Collect endpoints whose subscription has expired on the push service
+    const expiredEndpoints = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled' && r.value?.expired) {
+        expiredEndpoints.push(user.pushSubscriptions[i].endpoint);
+      }
+    });
 
-    if (expiredIndexes.length > 0) {
+    // Clean up expired subscriptions in one DB write
+    if (expiredEndpoints.length > 0) {
       await User.updateOne(
         { _id: userId },
-        { $pull: { pushSubscriptions: { endpoint: { $in: expiredIndexes.map(i => user.pushSubscriptions[i].endpoint) } } } }
+        { $pull: { pushSubscriptions: { endpoint: { $in: expiredEndpoints } } } }
       );
+      logger.info(`[Push] Removed ${expiredEndpoints.length} expired subscription(s) for user ${userId}`);
     }
   } catch (err) {
-    logger.error('Direct push error:', err.message);
+    logger.error('[Push] sendDirectPush failed:', err.message);
   }
 }
 
 /**
- * Send bulk payment requests to expense members.
+ * Send payment-request push notifications to multiple expense members.
+ * Called by the notifyMembers controller action.
  */
 async function sendBulkPaymentRequest(expense, members, requester) {
-  const notifications = members.map(member => createNotification({
-    recipientId: member.userId._id || member.userId,
-    senderId: requester.id,
-    type: 'payment_request',
-    title: 'Payment Request',
-    body: `${requester.displayName || requester.username} is requesting ${expense.currency} ${member.amount} for "${expense.description}"`,
-    data: {
-      expenseId: expense._id,
-      amount: member.amount,
-      currency: expense.currency,
-    },
-  }));
+  const notifications = members.map(member =>
+    createNotification({
+      recipientId: member.userId._id || member.userId,
+      senderId:    requester.id,
+      type:        'payment_request',
+      title:       '💰 Payment Request',
+      body:        `${requester.displayName || requester.username} is requesting ${expense.currency} ${member.amount} for "${expense.description}"`,
+      data: {
+        expenseId: expense._id.toString(),
+        amount:    member.amount,
+        currency:  expense.currency,
+        url:       '/notifications',
+      },
+    })
+  );
 
   return Promise.allSettled(notifications);
 }
