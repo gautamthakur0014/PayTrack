@@ -1,38 +1,46 @@
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useCallback } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import {
   Plus, Search, Filter, Trash2, Edit2, Bell, CheckCircle,
-  ChevronLeft, ChevronRight, Receipt, Lock, TrendingDown, CloudOff
+  ChevronLeft, ChevronRight, Receipt, Lock, TrendingDown,
+  CloudOff, X, Calendar
 } from 'lucide-react';
 import {
   fetchExpenses, deleteExpense, markMemberPaid,
-  notifyMembers, setFilters
+  notifyMembers, setFilters, setPage, clearFilters
 } from '../store/slices/expensesSlice';
 import { fetchGroups } from '../store/slices/groupsSlice';
 import { PageHeader, EmptyState, Spinner } from '../components/ui/index';
 import Modal from '../components/ui/Modal';
 import ExpenseForm from '../components/expenses/ExpenseForm';
 import ExpenseDetail from '../components/expenses/ExpenseDetail';
-import { format } from 'date-fns';
+import { format, startOfMonth, endOfMonth } from 'date-fns';
 
 const CATEGORY_EMOJI = {
   food: '🍕', travel: '✈️', rent: '🏠', utilities: '⚡',
   entertainment: '🎮', health: '💊', shopping: '🛍️', other: '📦'
 };
+
 const CATEGORIES = ['food', 'travel', 'rent', 'utilities', 'entertainment', 'health', 'shopping', 'other'];
 const TYPES = [
-  { value: 'individual', label: 'Personal' },
-  { value: 'equal_group', label: 'Equal Split' },
+  { value: 'individual',   label: 'Personal' },
+  { value: 'equal_group',  label: 'Equal Split' },
   { value: 'custom_group', label: 'Custom Split' },
 ];
 
+// ── Date helpers ──────────────────────────────────────────────────────────────
+const thisYear  = new Date().getFullYear();
+const thisMonth = new Date().getMonth() + 1;
+
+function monthLabel(year, month) {
+  return format(new Date(year, month - 1), 'MMMM yyyy');
+}
+
 /**
- * Returns how much of this expense the logged-in user is responsible for.
- *
- * - Owner, no members  → full amount (personal expense)
- * - Owner, has members → net out-of-pocket = totalAmount − recoveredAmount
- *   (they paid upfront but recover from others)
- * - Member (not owner) → only their member.amount
+ * Returns how much of this expense the logged-in user personally owes/paid.
+ * - Owner, no members  → full amount
+ * - Owner, has members → totalAmount − recoveredAmount (net out-of-pocket)
+ * - Member (not owner) → their member.amount entry
  */
 function getUserShare(expense, userId) {
   const isOwner =
@@ -42,10 +50,8 @@ function getUserShare(expense, userId) {
 
   if (isOwner) {
     if (!expense.members?.length) return expense.amount || 0;
-    const recovered = expense.recoveredAmount || 0;
-    return Math.max(0, (expense.totalAmount || expense.amount || 0) - recovered);
+    return Math.max(0, (expense.totalAmount || expense.amount || 0) - (expense.recoveredAmount || 0));
   }
-
   const myEntry = expense.members?.find(m => {
     const mid = m.userId?._id || m.userId;
     return mid === userId || mid?.toString() === userId;
@@ -53,41 +59,54 @@ function getUserShare(expense, userId) {
   return myEntry?.amount || 0;
 }
 
+// ── Filter mode options ───────────────────────────────────────────────────────
+// 'month' = single month picker  |  'range' = from-date to-date
+const FILTER_MODES = ['month', 'range'];
+
 export default function ExpensesPage() {
   const dispatch = useDispatch();
   const { items, pagination, loading, filters } = useSelector(s => s.expenses);
   const { user } = useSelector(s => s.auth);
-  const [showForm, setShowForm] = useState(false);
-  const [editTarget, setEditTarget] = useState(null);
-  const [detailTarget, setDetailTarget] = useState(null);
-  const [search, setSearch] = useState('');
-  const [filterOpen, setFilterOpen] = useState(false);
 
+  const [showForm,     setShowForm]     = useState(false);
+  const [editTarget,   setEditTarget]   = useState(null);
+  const [detailTarget, setDetailTarget] = useState(null);
+  const [search,       setSearch]       = useState('');
+  const [filterOpen,   setFilterOpen]   = useState(false);
+  const [filterMode,   setFilterMode]   = useState('month'); // 'month' | 'range'
+  const [status,   setStatus]   = useState('you owe');
+
+  // Local range state (not dispatched until both dates are set)
+  const [rangeFrom, setRangeFrom] = useState('');
+  const [rangeTo,   setRangeTo]   = useState('');
+
+  // Fetch when filters change
   useEffect(() => {
     dispatch(fetchExpenses(filters));
     dispatch(fetchGroups());
   }, [dispatch, filters]);
 
-  // ── Total: sum of user's share only ──────────────────────────────────────
+  // ── Summary ───────────────────────────────────────────────────────────────
   const { pageTotal, hasShared } = useMemo(() => {
-    let total = 0;
-    let shared = false;
+    let total = 0, shared = false;
     items.forEach(e => {
-      const share = getUserShare(e, user?._id);
-      total += share;
+      total += getUserShare(e, user?._id);
       if (e.members?.length > 0) shared = true;
     });
     return { pageTotal: total, hasShared: shared };
   }, [items, user?._id]);
 
-  const isFiltered = !!(filters.category || filters.type || filters.month || filters.search);
+  const isFiltered = !!(filters.category || filters.type || filters.month || filters.startDate);
 
   const periodLabel = useMemo(() => {
-    if (filters.year && filters.month) {
-      return format(new Date(filters.year, filters.month - 1), 'MMMM yyyy');
+    if (filters.startDate && filters.endDate) {
+      return `${format(new Date(filters.startDate), 'MMM d, yyyy')} – ${format(new Date(filters.endDate), 'MMM d, yyyy')}`;
     }
-    return 'current view';
-  }, [filters.year, filters.month]);
+    if (filters.year && filters.month) return monthLabel(filters.year, filters.month);
+    return 'all time';
+  }, [filters]);
+
+  // ── Handlers ─────────────────────────────────────────────────────────────
 
   const handleSearch = (e) => {
     setSearch(e.target.value);
@@ -96,23 +115,55 @@ export default function ExpensesPage() {
     }
   };
 
+  // !! KEY FIX: use setPage not setFilters for pagination !!
+  const handlePage = (p) => {
+    dispatch(setPage(p));
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   const handleDelete = async (id) => {
     if (!confirm('Delete this expense?')) return;
     dispatch(deleteExpense(id));
   };
-
-  const handlePage = (page) => dispatch(setFilters({ page }));
 
   const handleMarkPaid = (expId, membId) => {
     dispatch(markMemberPaid({ expenseId: expId, memberId: membId }));
     setDetailTarget(null);
   };
 
+  const handleMonthChange = (e) => {
+    if (!e.target.value) return;
+    const [y, m] = e.target.value.split('-');
+    dispatch(setFilters({ year: y, month: m, startDate: undefined, endDate: undefined }));
+  };
+
+  const handleRangeApply = () => {
+    if (!rangeFrom || !rangeTo) return;
+    dispatch(setFilters({
+      startDate: rangeFrom,
+      endDate:   rangeTo,
+      year:      undefined,
+      month:     undefined,
+    }));
+  };
+
+  const handleClearFilters = () => {
+    dispatch(clearFilters()); // resets to current month
+    setSearch('');
+    setRangeFrom('');
+    setRangeTo('');
+    setFilterMode('month');
+  };
+
+  const currentMonthValue = filters.year && filters.month
+    ? `${filters.year}-${String(filters.month).padStart(2, '0')}`
+    : `${thisYear}-${String(thisMonth).padStart(2, '0')}`;
+
   return (
     <div className="space-y-5 animate-fade-in">
       <PageHeader
         title="Expenses"
-        subtitle={`${pagination?.total || 0} total expenses`}
+        subtitle={`${pagination?.total || 0} expense${pagination?.total !== 1 ? 's' : ''} · ${periodLabel}`}
         action={
           <button onClick={() => { setEditTarget(null); setShowForm(true); }}
             className="btn-primary flex items-center gap-2">
@@ -121,7 +172,7 @@ export default function ExpensesPage() {
         }
       />
 
-      {/* ── My share summary bar ──────────────────────────────────────────── */}
+      {/* ── Summary bar ──────────────────────────────────────────────────── */}
       <div className="card flex items-center justify-between gap-4 py-3.5"
         style={{ background: 'linear-gradient(to right, rgba(20,184,166,0.08), transparent)' }}>
         <div className="flex items-center gap-3">
@@ -130,23 +181,23 @@ export default function ExpensesPage() {
           </div>
           <div>
             <p className="text-xs text-muted-custom font-medium uppercase tracking-wider">
-              My total — {isFiltered ? periodLabel : 'this page'}&nbsp;
-              {hasShared && <span className="text-teal-400 normal-case">(your share only)</span>}
+              My total · {periodLabel}
+              {hasShared && <span className="text-teal-400 normal-case ml-1">(your share)</span>}
             </p>
             <p className="font-display font-bold text-2xl text-primary-custom">
-              ${pageTotal.toFixed(2)}
+              ₹{pageTotal.toFixed(2)}
             </p>
           </div>
         </div>
         {pagination?.total && pagination.total > items.length && (
           <p className="text-xs text-muted-custom hidden sm:block text-right">
             Showing {items.length} of {pagination.total}<br />
-            <span className="text-teal-400">Filter by month for full totals</span>
+            <span className="text-teal-400">page {filters.page} of {pagination.totalPages}</span>
           </p>
         )}
       </div>
 
-      {/* ── Search + filter row ───────────────────────────────────────────── */}
+      {/* ── Search + filter toggle ────────────────────────────────────────── */}
       <div className="flex flex-col sm:flex-row gap-3">
         <div className="relative flex-1">
           <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-muted-custom" />
@@ -160,52 +211,132 @@ export default function ExpensesPage() {
         </button>
       </div>
 
+      {/* ── Filter panel ─────────────────────────────────────────────────── */}
       {filterOpen && (
-        <div className="card animate-slide-down grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <div>
-            <label className="label text-xs">Category</label>
-            <select className="input-field text-sm" value={filters.category || ''}
-              onChange={e => dispatch(setFilters({ category: e.target.value || undefined }))}>
-              <option value="">All</option>
-              {CATEGORIES.map(c => <option key={c} value={c}>{CATEGORY_EMOJI[c]} {c}</option>)}
-            </select>
+        <div className="card animate-slide-down space-y-4">
+          {/* Row 1: category + type */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div>
+              <label className="label text-xs">Category</label>
+              <select className="input-field text-sm" value={filters.category || ''}
+                onChange={e => dispatch(setFilters({ category: e.target.value || undefined }))}>
+                <option value="">All categories</option>
+                {CATEGORIES.map(c => <option key={c} value={c}>{CATEGORY_EMOJI[c]} {c}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="label text-xs">Type</label>
+              <select className="input-field text-sm" value={filters.type || ''}
+                onChange={e => dispatch(setFilters({ type: e.target.value || undefined }))}>
+                <option value="">All types</option>
+                {TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+              </select>
+            </div>
+
+            {/* Date mode toggle */}
+            <div className="col-span-2 sm:col-span-2 flex flex-col justify-end">
+              <label className="label text-xs flex items-center gap-1.5">
+                <Calendar size={12} /> Date filter
+              </label>
+              <div className="flex gap-1 p-1 rounded-xl" style={{ background: 'var(--bg-input)', border: '1px solid var(--border)' }}>
+                {FILTER_MODES.map(mode => (
+                  <button key={mode} type="button"
+                    onClick={() => setFilterMode(mode)}
+                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-all capitalize ${
+                      filterMode === mode
+                        ? 'bg-teal-500/15 text-teal-400 border border-teal-500/20'
+                        : 'text-muted-custom hover:text-secondary-custom'
+                    }`}>
+                    {mode === 'month' ? 'By Month' : 'Date Range'}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
-          <div>
-            <label className="label text-xs">Type</label>
-            <select className="input-field text-sm" value={filters.type || ''}
-              onChange={e => dispatch(setFilters({ type: e.target.value || undefined }))}>
-              <option value="">All</option>
-              {TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="label text-xs">Month</label>
-            <input type="month" className="input-field text-sm" onChange={e => {
-              const [y, m] = e.target.value.split('-');
-              dispatch(setFilters({ year: y, month: m }));
-            }} />
-          </div>
-          <div className="flex items-end">
-            <button className="btn-ghost text-sm w-full" onClick={() => {
-              dispatch(setFilters({ category: undefined, type: undefined, month: undefined, year: undefined, search: undefined }));
-              setSearch('');
-            }}>Clear filters</button>
-          </div>
+
+          {/* Row 2: date filter */}
+          {filterMode === 'month' ? (
+            <div className="flex items-end gap-3">
+              <div className="flex-1">
+                <label className="label text-xs">Month</label>
+                <input type="month" className="input-field text-sm"
+                  value={currentMonthValue}
+                  onChange={handleMonthChange}
+                />
+              </div>
+              <button className="btn-ghost text-sm px-4 py-2.5 flex-shrink-0" onClick={handleClearFilters}>
+                <X size={14} className="inline mr-1" />Clear
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-col sm:flex-row items-end gap-3">
+              <div className="flex-1">
+                <label className="label text-xs">From</label>
+                <input type="date" className="input-field text-sm"
+                  value={rangeFrom} onChange={e => setRangeFrom(e.target.value)} />
+              </div>
+              <div className="flex-1">
+                <label className="label text-xs">To</label>
+                <input type="date" className="input-field text-sm"
+                  value={rangeTo} onChange={e => setRangeTo(e.target.value)} />
+              </div>
+              <button
+                onClick={handleRangeApply}
+                disabled={!rangeFrom || !rangeTo}
+                className="btn-primary text-sm px-4 py-2.5 flex-shrink-0 disabled:opacity-40">
+                Apply range
+              </button>
+              <button className="btn-ghost text-sm px-3 py-2.5 flex-shrink-0" onClick={handleClearFilters}>
+                <X size={14} />
+              </button>
+            </div>
+          )}
+
+          {/* Active filter chips */}
+          {isFiltered && (
+            <div className="flex flex-wrap gap-2 pt-1">
+              {filters.category && (
+                <span className="badge badge-brand text-xs flex items-center gap-1">
+                  {CATEGORY_EMOJI[filters.category]} {filters.category}
+                  <button onClick={() => dispatch(setFilters({ category: undefined }))}><X size={10} /></button>
+                </span>
+              )}
+              {filters.type && (
+                <span className="badge badge-blue text-xs flex items-center gap-1">
+                  {TYPES.find(t => t.value === filters.type)?.label}
+                  <button onClick={() => dispatch(setFilters({ type: undefined }))}><X size={10} /></button>
+                </span>
+              )}
+              {filters.startDate && (
+                <span className="badge badge-yellow text-xs flex items-center gap-1">
+                  📅 {format(new Date(filters.startDate), 'MMM d')} – {format(new Date(filters.endDate), 'MMM d, yyyy')}
+                  <button onClick={() => { dispatch(setFilters({ startDate: undefined, endDate: undefined })); setRangeFrom(''); setRangeTo(''); }}><X size={10} /></button>
+                </span>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {/* ── List ──────────────────────────────────────────────────────────── */}
+      {/* ── Expenses list ─────────────────────────────────────────────────── */}
       {loading ? (
         <div className="flex justify-center py-12"><Spinner size={28} /></div>
       ) : items.length === 0 ? (
         <EmptyState
           icon={Receipt}
           title="No expenses found"
-          description="Add your first expense to get started tracking"
+          description={isFiltered ? "No expenses match your filters" : "Add your first expense to get started"}
           action={
-            <button onClick={() => setShowForm(true)} className="btn-primary flex items-center gap-2">
-              <Plus size={16} /> Add Expense
-            </button>
+            <div className="flex gap-2">
+              {isFiltered && (
+                <button onClick={handleClearFilters} className="btn-secondary flex items-center gap-2">
+                  <X size={14} /> Clear filters
+                </button>
+              )}
+              <button onClick={() => setShowForm(true)} className="btn-primary flex items-center gap-2">
+                <Plus size={16} /> Add Expense
+              </button>
+            </div>
           }
         />
       ) : (
@@ -218,26 +349,31 @@ export default function ExpensesPage() {
 
             const myMemberEntry = !isOwner
               ? exp.members?.find(m => {
-                const mid = m.userId?._id || m.userId;
-                return mid === user?._id || mid?.toString() === user?._id;
-              })
+                  const mid = m.userId?._id || m.userId;
+                  return mid === user?._id || mid?.toString() === user?._id;
+                })
               : null;
 
-            const myShare = getUserShare(exp, user?._id);
-            const isGroupExpense = exp.members?.length > 0;
-            const sharesDiffer = isGroupExpense && Math.abs(myShare - exp.amount) > 0.001;
+            const myShare    = getUserShare(exp, user?._id);
+            const sharesDiff = exp.members?.length > 0 && Math.abs(myShare - (exp.amount || 0)) > 0.01;
 
             return (
-              <div
-                key={exp._id}
-                className={`card hover:border-teal-500/20 transition-all group cursor-pointer ${!isOwner ? 'border-teal-500/10' : ''} ${exp._isOffline ? 'border-yellow-500/30' : ''}`}
-                onClick={() => setDetailTarget(exp)}
-              >
+              <div key={exp._id}
+                className={`card hover:border-teal-500/20 transition-all group cursor-pointer  ${
+                  !isOwner ? 'border-teal-500/10' : ''
+                } ${exp._isOffline ? 'border-yellow-500/30' : ''}`}
+                onClick={() => setDetailTarget(exp)}>
+{/* ${myMemberEntry?.status === 'paid'
+  ? 'bg-brand-600'
+  : myMemberEntry?.status === undefined
+  ? ' '
+  : 'bg-yellow-500'} */}
                 <div className="flex items-center gap-4">
                   <div className="w-11 h-11 rounded-xl flex items-center justify-center text-xl flex-shrink-0"
                     style={{ background: 'var(--bg-input)' }}>
                     {CATEGORY_EMOJI[exp.category] || '📦'}
                   </div>
+
                   <div className="flex-1 min-w-0">
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
@@ -251,7 +387,9 @@ export default function ExpensesPage() {
                           )}
                         </div>
                         <div className="flex flex-wrap items-center gap-2 mt-1">
-                          <span className="text-muted-custom text-xs">{format(new Date(exp.expenseDate), 'MMM d, yyyy')}</span>
+                          <span className="text-muted-custom text-xs">
+                            {format(new Date(exp.expenseDate), 'MMM d, yyyy')}
+                          </span>
                           <span className={`badge text-xs ${
                             exp.type === 'individual' ? 'badge-blue' :
                             exp.type === 'equal_group' ? 'badge-brand' : 'badge-yellow'
@@ -259,22 +397,21 @@ export default function ExpensesPage() {
                           {exp.groupId && <span className="badge badge-green text-xs">group</span>}
                         </div>
                       </div>
+
                       <div className="text-right flex-shrink-0">
-                        {/* Total amount */}
                         <p className="font-mono font-bold text-primary-custom">
                           {exp.currency} {exp.amount?.toFixed(2)}
                         </p>
-                        {/* My share if different from total */}
-                        {sharesDiffer && (
+                        {sharesDiff && (
                           <p className="text-xs font-mono text-teal-400 mt-0.5">
                             my share: {exp.currency} {myShare.toFixed(2)}
                           </p>
                         )}
                         {myMemberEntry && (
                           <p className="text-xs mt-0.5">
-                            <span className={myMemberEntry.status === 'paid' ? 'text-green-400' : 'text-yellow-500'}>
-                              you owe: {exp.currency} {myMemberEntry.amount?.toFixed(2)}
-                              {myMemberEntry.status === 'paid' ? ' ✓' : ''}
+                            <span className={myMemberEntry.status === 'paid' ? 'text-green-400 font-bold ' : 'text-yellow-500'}>
+                              {exp.currency} {myMemberEntry.amount?.toFixed(2)} 
+                              {myMemberEntry.status === 'paid' ? ' ✓ PAID': ': to be Paid'}
                             </span>
                           </p>
                         )}
@@ -292,15 +429,14 @@ export default function ExpensesPage() {
                           {exp.members.slice(0, 4).map((m, i) => (
                             <div key={i}
                               className="w-6 h-6 rounded-full border-2 flex items-center justify-center text-[9px] font-bold text-white"
-                              style={{
-                                backgroundColor: m.avatarColor || m.userId?.avatarColor || '#64748b',
-                                borderColor: 'var(--bg-card)'
-                              }}>
+                              style={{ backgroundColor: m.avatarColor || m.userId?.avatarColor || '#64748b', borderColor: 'var(--bg-card)' }}>
                               {(m.displayName || m.userId?.displayName || '?').slice(0, 1)}
                             </div>
                           ))}
                         </div>
-                        <span className="text-muted-custom text-xs">{exp.members.length} member{exp.members.length !== 1 ? 's' : ''}</span>
+                        <span className="text-muted-custom text-xs">
+                          {exp.members.length} member{exp.members.length !== 1 ? 's' : ''}
+                        </span>
                         <span className={`text-xs ${exp.isFullySettled ? 'text-green-400' : 'text-yellow-500'}`}>
                           {exp.isFullySettled ? '✓ Settled' : `${exp.members.filter(m => m.status !== 'paid').length} pending`}
                         </span>
@@ -309,12 +445,11 @@ export default function ExpensesPage() {
                   </div>
                 </div>
 
-                {/* Actions */}
+                {/* Hover actions */}
                 <div
                   className="mt-3 pt-3 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity"
                   style={{ borderTop: '1px solid var(--border-subtle)' }}
-                  onClick={e => e.stopPropagation()}
-                >
+                  onClick={e => e.stopPropagation()}>
                   {isOwner ? (
                     <>
                       <button onClick={() => { setEditTarget(exp); setShowForm(true); }}
@@ -357,22 +492,52 @@ export default function ExpensesPage() {
         </div>
       )}
 
-      {/* Pagination */}
+      {/* ── Pagination ────────────────────────────────────────────────────── */}
       {pagination && pagination.totalPages > 1 && (
         <div className="flex items-center justify-center gap-2 pt-2">
-          <button disabled={filters.page <= 1} onClick={() => handlePage(filters.page - 1)}
+          <button
+            disabled={filters.page <= 1}
+            onClick={() => handlePage(filters.page - 1)}
             className="btn-secondary p-2 disabled:opacity-40">
             <ChevronLeft size={16} />
           </button>
-          <span className="text-muted-custom text-sm px-3">Page {filters.page} of {pagination.totalPages}</span>
-          <button disabled={!pagination.hasMore} onClick={() => handlePage(filters.page + 1)}
+
+          {/* Page number pills */}
+          <div className="flex items-center gap-1">
+            {Array.from({ length: pagination.totalPages }, (_, i) => i + 1)
+              .filter(p => p === 1 || p === pagination.totalPages || Math.abs(p - filters.page) <= 1)
+              .reduce((acc, p, i, arr) => {
+                if (i > 0 && p - arr[i - 1] > 1) acc.push('…');
+                acc.push(p);
+                return acc;
+              }, [])
+              .map((p, i) =>
+                p === '…' ? (
+                  <span key={`ellipsis-${i}`} className="text-muted-custom text-sm px-1">…</span>
+                ) : (
+                  <button key={p} onClick={() => handlePage(p)}
+                    className={`w-9 h-9 rounded-xl text-sm font-medium transition-all ${
+                      p === filters.page
+                        ? 'bg-teal-500/15 text-teal-400 border border-teal-500/20'
+                        : 'text-muted-custom hover:text-secondary-custom'
+                    }`}
+                    style={p !== filters.page ? { background: 'var(--bg-input)' } : {}}>
+                    {p}
+                  </button>
+                )
+              )}
+          </div>
+
+          <button
+            disabled={!pagination.hasMore}
+            onClick={() => handlePage(filters.page + 1)}
             className="btn-secondary p-2 disabled:opacity-40">
             <ChevronRight size={16} />
           </button>
         </div>
       )}
 
-      {/* Modals */}
+      {/* ── Modals ────────────────────────────────────────────────────────── */}
       <Modal open={showForm} onClose={() => { setShowForm(false); setEditTarget(null); }}
         title={editTarget ? 'Edit Expense' : 'New Expense'} size="lg">
         <ExpenseForm
@@ -387,7 +552,12 @@ export default function ExpensesPage() {
 
       <Modal open={!!detailTarget} onClose={() => setDetailTarget(null)} title="Expense Details" size="lg">
         {detailTarget && (
-          <ExpenseDetail expense={detailTarget} currentUserId={user?._id} onMarkPaid={handleMarkPaid} />
+          <ExpenseDetail
+            expense={detailTarget}
+            currentUserId={user?._id}
+            onMarkPaid={handleMarkPaid}
+            onNotifyMember={(expId) => dispatch(notifyMembers(expId))}
+          />
         )}
       </Modal>
     </div>

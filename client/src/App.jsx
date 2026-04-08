@@ -16,6 +16,7 @@ import NotificationsPage from './pages/NotificationsPage';
 import AnalyticsPage from './pages/AnalyticsPage';
 import ProfilePage from './pages/ProfilePage';
 import FeedbackPage from './pages/FeedbackPage';
+import SearchPage from './pages/SearchPage';
 import LoadingScreen from './components/ui/LoadingScreen';
 
 const ProtectedRoute = ({ children }) => {
@@ -35,15 +36,11 @@ export default function App() {
   const { initialized } = useSelector(s => s.auth);
 
   useEffect(() => {
-    const token = localStorage.getItem('access_token');
+    const token      = localStorage.getItem('access_token');
     const cachedUser = localStorage.getItem('cached_user');
-    if (token) {
-      dispatch(fetchMe());
-    } else if (cachedUser) {
-      dispatch({ type: 'auth/restoreOffline', payload: JSON.parse(cachedUser) });
-    } else {
-      dispatch({ type: 'auth/me/rejected' });
-    }
+    if (token)           dispatch(fetchMe());
+    else if (cachedUser) dispatch({ type: 'auth/restoreOffline', payload: JSON.parse(cachedUser) });
+    else                 dispatch({ type: 'auth/me/rejected' });
   }, [dispatch]);
 
   if (!initialized) return <LoadingScreen />;
@@ -51,22 +48,25 @@ export default function App() {
   return (
     <Routes>
       <Route element={<GuestRoute><AuthLayout /></GuestRoute>}>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/register" element={<RegisterPage />} />
+        <Route path="/login"          element={<LoginPage />} />
+        <Route path="/register"       element={<RegisterPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
       </Route>
+
       <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
-        <Route path="/dashboard" element={<DashboardPage />} />
-        <Route path="/expenses" element={<ExpensesPage />} />
-        <Route path="/groups" element={<GroupsPage />} />
-        <Route path="/connections" element={<ConnectionsPage />} />
+        <Route path="/dashboard"     element={<DashboardPage />} />
+        <Route path="/expenses"      element={<ExpensesPage />} />
+        <Route path="/groups"        element={<GroupsPage />} />
+        <Route path="/connections"   element={<ConnectionsPage />} />
+        <Route path="/search"        element={<SearchPage />} />
         <Route path="/notifications" element={<NotificationsPage />} />
-        <Route path="/analytics" element={<AnalyticsPage />} />
-        <Route path="/profile" element={<ProfilePage />} />
-        <Route path="/feedback" element={<FeedbackPage />} />
+        <Route path="/analytics"     element={<AnalyticsPage />} />
+        <Route path="/profile"       element={<ProfilePage />} />
+        <Route path="/feedback"      element={<FeedbackPage />} />
       </Route>
-      <Route path="/" element={<Navigate to="/dashboard" replace />} />
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+
+      <Route path="/"  element={<Navigate to="/dashboard" replace />} />
+      <Route path="*"  element={<Navigate to="/dashboard" replace />} />
     </Routes>
   );
 }
